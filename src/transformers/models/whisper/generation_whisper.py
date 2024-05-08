@@ -277,6 +277,7 @@ class WhisperGenerationMixin:
         return_token_timestamps: Optional[bool] = None,
         return_segments: bool = False,
         return_dict_in_generate: Optional[bool] = None,
+        force_longform: bool = False,
         **kwargs,
     ):
         """
@@ -483,7 +484,7 @@ class WhisperGenerationMixin:
         batch_size, total_input_frames = self._retrieve_total_input_frames(
             input_features=input_features, input_stride=input_stride, kwargs=kwargs
         )
-        is_shortform = total_input_frames <= num_segment_frames
+        is_shortform = (total_input_frames <= num_segment_frames) and not force_longform
 
         if is_shortform:
             # warn user of ignored inputs
@@ -821,7 +822,7 @@ class WhisperGenerationMixin:
                         seek_outputs[i]["token_timestamps"] = seek_outputs[i]["token_timestamps"][:-num_paddings]
 
                 # check which sequences in batch need fallback & which should be skipped
-                needs_fallback[i], should_skip[i] = self._need_fallback(
+                needs_fallback[i], should_skip[i], seek_outputs[i]["fallback_info"] = self._need_fallback(
                     seek_sequence,
                     seek_outputs,
                     i,
@@ -830,6 +831,8 @@ class WhisperGenerationMixin:
                     self.config.vocab_size,
                     temperature,
                 )
+
+                seek_outputs[i]["fallback_info"]["temperature"] = temperature
 
                 seek_sequence_list[fallback_index_map[i]] = seek_sequence
                 seek_outputs_list[fallback_index_map[i]] = seek_outputs[i]
@@ -917,8 +920,11 @@ class WhisperGenerationMixin:
     ):
         needs_fallback = False
         should_skip = False
+        fallback_info = {}
+
         if generation_config.compression_ratio_threshold is not None:
             compression_ratio = self._retrieve_compression_ratio(seek_sequence, vocab_size)
+            fallback_info["compression_ratio"] = compression_ratio
 
             if compression_ratio > generation_config.compression_ratio_threshold:
                 needs_fallback = True
@@ -932,6 +938,8 @@ class WhisperGenerationMixin:
                     scores, seek_sequence, generation_config.eos_token_id, temperature
                 )
 
+            fallback_info["avg_logprob"] = logprobs.item()
+
             if logprobs < generation_config.logprob_threshold:
                 needs_fallback = True
 
@@ -940,6 +948,8 @@ class WhisperGenerationMixin:
                 logits_processor, WhisperNoSpeechDetection, "no_speech_prob"
             )
 
+            fallback_info["no_speech_prob"] = no_speech_prob[index].item()
+
             if (
                 logprobs < generation_config.logprob_threshold
                 and no_speech_prob[index] > generation_config.no_speech_threshold
@@ -947,7 +957,7 @@ class WhisperGenerationMixin:
                 needs_fallback = False
                 should_skip = True
 
-        return needs_fallback, should_skip
+        return needs_fallback, should_skip, fallback_info
 
     @staticmethod
     def _setup_no_speech_detection(logits_processor, segment_input, decoder_input_ids, kwargs):
